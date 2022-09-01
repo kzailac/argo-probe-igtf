@@ -3,7 +3,7 @@
 Summary: ARGO probes for IGTF CA distribution validation
 Name: argo-probe-igtf
 Version: 2.0.0
-Release: 1%{?dist}
+Release: 2%{?dist}
 License: ASL 2.0
 Group: Network/Monitoring
 Source0: %{name}-%{version}.tar.gz
@@ -33,6 +33,8 @@ rm -rf $RPM_BUILD_ROOT
 %attr(0770,nagios,nagios) /var/spool/argo/probes/%{name}
 
 %changelog
+* Thu Sep 1 2022 Katarina Zailac <kzailac@srce.hr> - 2.0.0-2%{?dist}
+- AO-651 Harmonize EGI probes
 * Mon Feb 1 2021 Emir Imamagic <eimamagi@srce.hr> - 1.5.0-1%{?dist}
 - Changes from ARGO central instances
 * Mon Dec 19 2016 Emir Imamagic <eimamagi@srce.hr> - 1.4.0-1%{?dist}
