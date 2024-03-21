@@ -10,6 +10,7 @@ Source0: %{name}-%{version}.tar.gz
 BuildRoot: %{_tmppath}/%{name}-%{version}-%{release}-root
 BuildArch: noarch
 Requires: nagios-common
+Requires: perl-Crypt-OpenSSL-X509
 
 %description
 
