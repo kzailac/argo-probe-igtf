@@ -1,0 +1,425 @@
+#! /usr/bin/perl -w
+#
+use strict;
+use Monitoring::Plugin;
+use POSIX;
+use XML::Simple;
+use LWP::UserAgent;
+use HTTP::Date;
+
+# Standard variables used in Monitoring::Plugin constructor
+use constant PROGNAME => 'check_igtf_ca';
+use constant VERSION => '1.0';
+use constant DESCRIPTION => 'Probe for IGTF CA certificate distribution.';
+use constant EXTRA_DESC => "";
+use constant LICENSE => 'This nagios plugin is free software, and comes with ABSOLUTELY NO WARRANTY.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+   http://www.apache.org/licenses/LICENSE-2.0
+Copyright 2015 Emir Imamagic';
+use constant USAGE => 'check_igtf_ca -H hostname -p port';
+use constant SHORTNAME => 'check_igtf_ca';
+use constant DEFAULT_RELEASE_FILE_URL => 'http://repository.egi.eu/sw/production/cas/1/current/meta/ca-policy-egi-core.release';
+use constant DEFAULT_IGTF_LIST_URL => 'http://repository.egi.eu/sw/production/cas/1/current/meta/ca-policy-egi-core.subjectdn';
+use constant DEFAULT_OBSOLETE_LIST_URL => 'http://repository.egi.eu/sw/production/cas/1/current/meta/ca-policy-egi-core.obsoleted-subjectdn';
+use constant DEFAULT_OLD_URL => 'http://lcg-ca.web.cern.ch/lcg-ca/distribution/ca-policy-lcg-OLD_VERSION-1/meta/';
+use constant DEFAULT_FILE_AGE => 24;
+use constant DEFAULT_CACHE_DIR => '/var/spool/nagios/nagios-plugins-igtf';
+use constant DEFAULT_HOST_CERT => '/etc/grid-security/hostcert.pem';
+use constant DEFAULT_HOST_KEY => '/etc/grid-security/hostkey.pem';
+
+sub getFileContent {
+    my $ua = shift;
+    my $url = shift;
+    my $msg = shift;
+    my $fileAge = shift;
+    my $content;
+    if ($url =~ /^http:\/\//) {
+        my $req = HTTP::Request->new(GET => $url);
+        my $res = $ua->request($req);
+        if (!$res->is_success) {
+            return (UNKNOWN, "Could not get $msg ($url): ".$res->status_line);
+        }
+        $content = $res->content;
+    } else {
+        return (UNKNOWN, "File $url does not exist") unless (-f $url);
+
+        # check the file age
+        if ($fileAge) {
+            my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+                   $atime,$mtime,$ctime,$blksize,$blocks) = stat($url);
+            if ($mtime) {
+                if ((time() - $mtime) > ($fileAge*3600)) {
+                    return (UNKNOWN, "File $msg is older than $fileAge hour(s)");
+                }
+            } else {
+                return (UNKNOWN, "Could not get $msg file age");
+            }
+        }
+
+        local($/) = undef;
+        return (UNKNOWN, "Could not open $msg file $url") unless (open(STD, $url));
+        $content = <STD>;
+        return (UNKNOWN, "Could not close $msg file $url") unless (close(STD));
+    }
+    return (OK, $content);
+}
+
+# get the release;
+sub getRelease {
+    my $ua = shift;
+    my $url = shift;
+    my $fileAge = shift;
+    my $releaseDate;
+    my $releaseVersion;
+    my $previousReleaseVersion;
+    my ($status, $content) = getFileContent($ua, $url, "release XML", $fileAge, 'ca-policy-egi-core.release');
+
+    return ($status, $content) if ($status != OK);
+
+    # parse the relase XML
+    my $doc;
+    eval {
+        $doc = XMLin($content);
+    };
+    if ($@) {
+        return (UNKNOWN, "Error parsing release XML file: $@");
+    }
+
+    # this is the expected output
+    # <Release>
+    #   <Date>28/10/2010</Date>
+    #   <Version>1.37-2</Version>
+    if (ref $doc eq 'HASH') {
+        if ($doc->{Date}) {
+            $releaseDate = str2time($doc->{Date});
+            return (UNKNOWN, "Release date cannot be converted with HTTP::Date: $doc->{Date}.") unless ($releaseDate);
+        } else {
+            return (UNKNOWN, "Release XML file does not contain tag Date.");
+        }
+        if ($doc->{Version}) {
+            if ($doc->{Version} =~ /((\d+?)\.(\d+?))\-(\d+?)/) {
+                $releaseVersion = $1;
+                $previousReleaseVersion = $2 . '.' . ( $3 - 1 );
+            } else {
+                return(UNKNOWN, "Release version has incorrect format: $doc->{Version}.");
+            }
+        } else {
+            return (UNKNOWN, "Release XML file does not contain tag Version.");
+        }
+    } else {
+        return (UNKNOWN, "Release XML file does not contain tag Release.");
+    }
+
+    return(OK, $releaseDate, $releaseVersion, $previousReleaseVersion);
+}
+
+sub compareCAVersion {
+    my $releaseDate = shift;
+    my $warning = shift;
+    my $critical = shift;
+
+    my $diff = sprintf ("%.2f", (time() - $releaseDate) / 86400);
+    if ($diff >= $critical) {
+        return(CRITICAL, "Old CA distribution version found, new version is $diff days old.");
+    } elsif ($diff >= $warning) {
+        return(WARNING, "Old CA distribution version found, new version is $diff days old.");
+    } elsif ($diff > 0) {
+        return(OK, "Old CA distribution version found, new version is $diff days old. We're still within grace period.");
+    } else {
+        return(OK, "Valid CA distribution version found. New version will be released in ".-$diff." days.");
+    }
+}
+
+sub getDNList {
+    my $ua = shift;
+    my $url = shift;
+    my $dnList = shift;
+    my $fileAge = shift;
+    my ($status, $content) = getFileContent($ua, $url, "list of packages", $fileAge);
+
+    return ($status, $content) if ($status != OK);
+
+    foreach my $line (split('\n',$content)) {
+        next if $line =~ /^#/;
+        $dnList->{$line} = 0;
+    }
+    return OK;
+}
+
+# Create Monitoring::Plugin instance
+my $plugin = Monitoring::Plugin->new (usage => USAGE,
+                                  shortname => SHORTNAME,
+                                  version => VERSION,
+                                  blurb => DESCRIPTION,
+                                  extra => EXTRA_DESC,
+                                  license => LICENSE,
+                                  plugin  => PROGNAME);
+$plugin->add_arg(
+    spec => 'hostname|H=s',
+    help => "H|hostname\n   Name or IP address of host to check.\n   (default: localhost)",
+    required => 0,
+    default => 'localhost'
+);
+$plugin->add_arg(
+    spec => 'port|p=i',
+    help => "p|port\n   Port of the service.\n   (default: 443)",
+    required => 0,
+    default => 443
+);
+$plugin->add_arg(
+    spec => 'release-url=s',
+    help => "   URL or path of release XML file. Multiple values should be comma separated.
+   (default: ".DEFAULT_RELEASE_FILE_URL.")",
+    required => 0,
+    default => DEFAULT_RELEASE_FILE_URL
+);
+$plugin->add_arg(
+    spec => 'igtf-list-url=s',
+    help => "   URL or path of IGTF DNs which should be installed.
+   Multiple values should be comma separated.
+   (default: ".DEFAULT_IGTF_LIST_URL.")",
+    required => 0,
+    default => DEFAULT_IGTF_LIST_URL
+);
+$plugin->add_arg(
+    spec => 'obsolete-list-url=s',
+    help => "   URL or path of obsoleted CAs which shouldn't be installed.
+   Multiple values should be comma separated.
+   (default: ".DEFAULT_OBSOLETE_LIST_URL.")",
+    required => 0,
+    default => DEFAULT_OBSOLETE_LIST_URL
+);
+$plugin->add_arg(
+    spec => 'cache-dir=s',
+    help => "   URL or path of obsoleted CAs which shouldn't be installed
+   with the previous version.
+   Multiple values should be comma separated.
+   (default: ".DEFAULT_CACHE_DIR.")",
+    required => 0,
+    default => DEFAULT_CACHE_DIR
+);
+$plugin->add_arg(
+    spec => 'cert=s',
+    help => "   Location of X509 certificate used for client AuthN
+   (default: ".DEFAULT_HOST_CERT.")",
+    required => 0,
+    default => DEFAULT_HOST_CERT
+);
+$plugin->add_arg(
+    spec => 'key=s',
+    help => "   Location of X509 key used for client AuthN
+   (default: ".DEFAULT_HOST_KEY.")",
+    required => 0,
+    default => DEFAULT_HOST_KEY
+);
+$plugin->add_arg(
+    spec => 'file-age=i',
+    help => "   Maximum age of file (in hours) in case when path is used for
+   release-url, package-list-url and obsolete-list-url. If files are
+   older they will be ignored. Set to 0 for infinite.
+   (default: ".DEFAULT_FILE_AGE.")",
+    required => 0,
+    default => DEFAULT_FILE_AGE
+);
+$plugin->add_arg(
+    spec => 'warning|w=i',
+    help => "w|warning\n   Warning threshold for certificate lifetime (days).\n   (default: 3)",
+    required => 0,
+    default => 3
+);
+$plugin->add_arg(
+    spec => 'critical|c=i',
+    help => "c|critical\n   Critical threshold for certificate lifetime (days).\n   (default: 8)",
+    required => 0,
+    default => 8
+);
+$plugin->add_arg(
+    spec => 'occi=s',
+    help => "occi\n   OCCI URL.\n   (default: )",
+    required => 0
+);
+
+$plugin->getopts;
+
+# Signal handler - TERM
+local $SIG{ALRM} = sub {
+    local $SIG{TERM} = 'IGNORE';
+    kill TERM => -$$;
+    $plugin->nagios_die("Timeout occured.");
+};
+
+local $SIG{TERM} = sub {
+    local $SIG{TERM} = 'IGNORE';
+    kill TERM => -$$;
+    $plugin->nagios_die("Plugin received TERM signal.");
+};
+
+my $host = $plugin->opts->hostname;
+my $port = $plugin->opts->port;
+my $cert = $plugin->opts->cert;
+my $key = $plugin->opts->key;
+my $cacheDir = $plugin->opts->get('cache-dir');
+my $defaultOldUrl = DEFAULT_OLD_URL;
+my $currentValidDNs = {};
+my $currentObsoleteDNs = {};
+my $previousValidDNs = {};
+my $previousObsoleteDNs = {};
+my $currentObsoleteDNsFound = {};
+my $previousObsoleteDNsFound = {};
+my $releaseDate;
+my $releaseVersion;
+my $previousReleaseVersion;
+my $output = "";
+my $finalOutput = "";
+my $status;
+my $ngiFrance;
+
+$plugin->nagios_die("Invalid TCP port $port") if ( $port <= 0 or $port > 65535 );
+$plugin->nagios_die("Invalid host name $host") if $host !~ /^[a-z0-9_]+[-a-z0-9\._]+$/;
+$ngiFrance = 1 if ($host =~ /\.fr$/);
+
+my $ua = LWP::UserAgent->new(env_proxy=>1);
+$ua->agent(PROGNAME .'/'.VERSION);
+
+# get the release
+$status = UNKNOWN;
+foreach my $url (split(',',$plugin->opts->get('release-url'))) {
+    ($status, $releaseDate, $releaseVersion, $previousReleaseVersion) = getRelease($ua, $url, $plugin->opts->get('file-age'));
+    last if ($status == OK);
+}
+if ($status == OK) {
+    $finalOutput .= "The official version is $releaseVersion. ";
+} else {
+    $plugin->nagios_die("Unable to get official version and date. $releaseDate");
+}
+
+# get list of valid CA DNs
+$status = UNKNOWN;
+$output = '';
+foreach my $url (split(',',$plugin->opts->get('igtf-list-url'))) {
+    ($status, $output) = getDNList($ua, $url, $currentValidDNs, $plugin->opts->get('file-age'));
+    last if ($status == OK);
+}
+if ($status != OK) {
+    $output = " (error: $output)" if ($output);
+    $plugin->nagios_die("Unable to get list of valid CA DNs".$output);
+}
+delete $currentValidDNs->{'/C=IR/O=IPM/O=IRAN-GRID/CN=IRAN-GRID CA'} if $ngiFrance;
+delete $currentValidDNs->{'/C=IR/O=IPM/OU=GCG/CN=IRAN-GRID-G2 CA'} if $ngiFrance;
+
+# get list of obsolete CA DNs
+foreach my $url (split(',',$plugin->opts->get('obsolete-list-url'))) {
+    ($status, $output) = getDNList($ua, $url, $currentObsoleteDNs, $plugin->opts->get('file-age'));
+    last if ($status == OK);
+}
+if ($status != OK) {
+    $output = " (error: $output)" if ($output);
+    $plugin->nagios_die("Unable to get list of obsolete CA DNs".$output);
+} 
+
+$defaultOldUrl =~ s/OLD_VERSION/$previousReleaseVersion/;
+
+# get list of valid CA DNs from previous release
+($status, $output) = getDNList($ua, $defaultOldUrl.'ca-policy-egi-core.subjectdn', $previousValidDNs, $plugin->opts->get('file-age'));
+if ($status != OK) {
+    $output = " (error: $output)" if ($output);
+    $finalOutput .= "Unable to get a list of valid CA DNs from previous release".$output.". Previous version check will be skipped. ";
+    undef $previousValidDNs;
+} else {
+    # get list of valid CA DNs from previous release
+    ($status, $output) = getDNList($ua, $defaultOldUrl.'ca-policy-egi-core.obsoleted-subjectdn', $previousObsoleteDNs, $plugin->opts->get('file-age'));
+    if ($status != OK) {
+        $output = " (error: $output)" if ($output);
+        $finalOutput .= "Unable to get a list of obsolete CA DNs from previous release".$output.". Previous version check will be skipped. ";
+        undef $previousObsoleteDNs;
+        undef $previousValidDNs;
+    } else {
+        delete $previousValidDNs->{'/C=IR/O=IPM/O=IRAN-GRID/CN=IRAN-GRID CA'} if $ngiFrance;
+        delete $previousValidDNs->{'/C=IR/O=IPM/OU=GCG/CN=IRAN-GRID-G2 CA'} if $ngiFrance;
+    } 
+}
+
+my $ssladd = "$host:$port";
+
+if ($plugin->opts->occi) {
+    my $agent = LWP::UserAgent->new;
+    my $req = HTTP::Request->new(GET => $plugin->opts->occi);
+    my $res = $agent->request($req);
+    my $keystone = $res->header('WWW-Authenticate');
+    if ( $keystone && $keystone =~ /\'http\S?:\/\/(\S+?)(\/)?\'/ ) {
+        $ssladd = $1;
+    }
+    if ( $ssladd !~ /\S+?:\d+/ ) {
+        $ssladd .= ':443';
+    }
+}
+
+my $inlist=0;
+print "Running command: /bin/echo 0 | /usr/bin/openssl s_client -ign_eof -prexit -cert $cert -key $key -connect $ssladd 2>/dev/null" if ($plugin->opts->verbose);
+if (!open CONN,"/bin/echo 0 | /usr/bin/openssl s_client -ign_eof -prexit -cert $cert -key $key -connect $ssladd 2>/dev/null |") {
+    $plugin->nagios_die("Unable to establish TLS connection with $host:$port.");
+}
+while (<CONN>) {
+    if (/^no peer certificate available/) {
+        $plugin->nagios_exit(OK, "Endpoint $host:$port is not TLS-enabled");
+    }
+    /^Acceptable client certificate CA names/ and $inlist++ and next;
+    /^---/ and $inlist=0 and next;
+    $inlist and /^\// and do {
+        chomp;
+        delete $currentValidDNs->{$_} if ( exists $currentValidDNs->{$_} );
+        $currentObsoleteDNsFound->{$_} = 1 if  ( exists $currentObsoleteDNs->{$_} );
+        if (defined $previousObsoleteDNs && defined $previousValidDNs) {
+            $previousObsoleteDNsFound->{$_} = 1 if ( exists $previousObsoleteDNs->{$_} );
+            delete $previousValidDNs->{$_} if  ( exists $previousValidDNs->{$_} );
+        }
+    };
+}
+close CONN;
+my @CAs;
+my $shouldCompare = 0;
+my $incorrectList = '';
+# First check if we have a valid version
+@CAs = keys %$currentValidDNs;
+if (@CAs) {
+    $shouldCompare = 1;
+    $incorrectList .= "\nThe following valid CAs are not installed: @CAs.";
+}
+@CAs = keys %$currentObsoleteDNsFound;
+if (@CAs) {
+    $shouldCompare = 1;
+    $incorrectList .= "\nThe following obsolete CAs found: @CAs. ";
+}
+
+if ($shouldCompare) {
+    my $shouldCompare = 0;
+    if (defined $previousObsoleteDNs && defined $previousValidDNs) {
+        @CAs = keys %$previousValidDNs;
+        unless (@CAs) {
+            my @previousObsoleteCAs = keys %$previousObsoleteDNsFound;
+            unless (@previousObsoleteCAs) {
+                $shouldCompare = 1;
+                $finalOutput .= "Previous CA version found ($previousReleaseVersion). ";
+            }
+        }
+    } else {
+        $shouldCompare = 1;
+    }
+
+    if ($shouldCompare) {
+        ($status, $output) = compareCAVersion($releaseDate, $plugin->opts->warning,
+                                              $plugin->opts->critical);
+        $finalOutput .= $output;
+    } else {
+        $status = CRITICAL;
+        $finalOutput .= "Unknown CA distribution version found.";
+    }
+} else {
+    $status = OK;
+    $finalOutput = "Valid CA distribution version ($releaseVersion) found.";
+}
+
+$plugin->nagios_exit($status, $finalOutput . $incorrectList);
+
